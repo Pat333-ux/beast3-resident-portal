@@ -1,0 +1,344 @@
+"""
+beast3-resident-portal | Unified Front Door for BEAST System 3.0
+Single-file FastAPI + HTML5/Tailwind Progressive Resident Portal.
+Run: pip install fastapi uvicorn pydantic && uvicorn app:app --reload
+"""
+
+import asyncio
+import hashlib
+import time
+from typing import List, Optional
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="BEAST 3.0 Unified Resident Portal", version="3.0.0")
+
+
+# ---------------------------------------------------------------------------
+# 1. Unified Intake Schema (Aligned with schemas-household-intake.json)
+# ---------------------------------------------------------------------------
+class HouseholdIntake(BaseModel):
+    zip_code: str = Field(..., min_length=5, max_length=10, examples=["47802"])
+    household_size: int = Field(..., ge=1, le=15, examples=[3])
+    gross_monthly_income: float = Field(..., ge=0, examples=[2400.0])
+    monthly_utility_cost: float = Field(default=220.0, ge=0)
+    is_veteran: bool = Field(default=False)
+    has_credit_challenges: bool = Field(default=False)
+    goal_first_home: bool = Field(default=False)
+
+
+class ProgramRecommendation(BaseModel):
+    division: str
+    program_name: str
+    estimated_monthly_value: float
+    estimated_one_time_value: float
+    confidence: str
+    next_action: str
+    tier_required: int
+
+
+class UnifiedRoadmapResponse(BaseModel):
+    intake_hash: str
+    total_estimated_monthly_value: float
+    total_estimated_one_time_value: float
+    recommendations: List[ProgramRecommendation]
+
+
+# ---------------------------------------------------------------------------
+# 2. Parallel Division Evaluators (Civic, Veterans, Credit, Home Loan)
+# ---------------------------------------------------------------------------
+async def evaluate_civic_aid(intake: HouseholdIntake) -> List[ProgramRecommendation]:
+    """Mirrors civic-aid-pipeline (Indiana FSSA: SNAP, Medicaid, LIHEAP)."""
+    await asyncio.sleep(0.05)  # Non-blocking division call
+    results: List[ProgramRecommendation] = []
+
+    # 2026 Federal Poverty Level (FPL) monthly baseline approximation
+    fpl_monthly = 1305 + (intake.household_size - 1) * 460
+
+    # SNAP (130% FPL gross income test in Indiana)
+    if intake.gross_monthly_income <= fpl_monthly * 1.30:
+        max_snap = 292 + (intake.household_size - 1) * 215
+        est_snap = max(50.0, round(max_snap - (intake.gross_monthly_income * 0.24), 2))
+        results.append(
+            ProgramRecommendation(
+                division="civic-aid-pipeline",
+                program_name="Indiana FSSA SNAP Food Assistance",
+                estimated_monthly_value=est_snap,
+                estimated_one_time_value=0.0,
+                confidence="High",
+                next_action="Verify income & generate pre-filled Indiana FSSA packet",
+                tier_required=3,
+            )
+        )
+
+    # Medicaid / Healthy Indiana Plan (HIP 2.0 - 138% FPL)
+    if intake.gross_monthly_income <= fpl_monthly * 1.38:
+        results.append(
+            ProgramRecommendation(
+                division="civic-aid-pipeline",
+                program_name="Healthy Indiana Plan (HIP 2.0 / Medicaid)",
+                estimated_monthly_value=450.0 * intake.household_size,
+                estimated_one_time_value=0.0,
+                confidence="High",
+                next_action="Confirm household SSNs for instant FSSA submission",
+                tier_required=3,
+            )
+        )
+
+    # LIHEAP Energy Assistance (60% State Median Income proxy)
+    if intake.gross_monthly_income <= fpl_monthly * 1.50 and intake.monthly_utility_cost > 0:
+        results.append(
+            ProgramRecommendation(
+                division="civic-aid-pipeline",
+                program_name="Indiana EAP / LIHEAP Utility Relief",
+                estimated_monthly_value=0.0,
+                estimated_one_time_value=525.0,
+                confidence="High",
+                next_action="Upload latest electric/gas bill for direct vendor credit",
+                tier_required=2,
+            )
+        )
+
+    return results
+
+
+async def evaluate_veterans_affairs(intake: HouseholdIntake) -> List[ProgramRecommendation]:
+    """Mirrors beast3-veterans-affairs."""
+    await asyncio.sleep(0.05)
+    if not intake.is_veteran:
+        return []
+    return [
+        ProgramRecommendation(
+            division="beast3-veterans-affairs",
+            program_name="Indiana Military Family Relief Fund (MFRF) & VA Benefits Audit",
+            estimated_monthly_value=350.0,
+            estimated_one_time_value=1500.0,
+            confidence="High",
+            next_action="Connect DD-214 & pair with Terre Haute Veteran Peer Navigator",
+            tier_required=2,
+        )
+    ]
+
+
+async def evaluate_credit_repair(intake: HouseholdIntake) -> List[ProgramRecommendation]:
+    """Mirrors credit-repair-orchestrator + LucrDebtSettlement.sol."""
+    await asyncio.sleep(0.05)
+    if not intake.has_credit_challenges:
+        return []
+    return [
+        ProgramRecommendation(
+            division="credit-repair-orchestrator",
+            program_name="FCRA Tradeline Audit & LUCR Gasless Debt Settlement",
+            estimated_monthly_value=115.0,
+            estimated_one_time_value=600.0,
+            confidence="Medium",
+            next_action="Run soft-pull bureau normalization & check LUCR matching escrow",
+            tier_required=3,
+        )
+    ]
+
+
+async def evaluate_home_loan(intake: HouseholdIntake) -> List[ProgramRecommendation]:
+    """Mirrors home-loan-orchestrator (IHCDA First-Time Homebuyer)."""
+    await asyncio.sleep(0.05)
+    if not intake.goal_first_home:
+        return []
+    return [
+        ProgramRecommendation(
+            division="home-loan-orchestrator",
+            program_name="IHCDA First Place Down Payment Assistance (Up to 6%)",
+            estimated_monthly_value=0.0,
+            estimated_one_time_value=9500.0,
+            confidence="Medium",
+            next_action="Generate pre-qualification readiness check & MISMO 3.4 profile",
+            tier_required=3,
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 3. Unified Fan-Out API Gateway Endpoint
+# ---------------------------------------------------------------------------
+@app.post("/api/evaluate-household", response_model=UnifiedRoadmapResponse)
+async def evaluate_household(intake: HouseholdIntake):
+    intake_hash = hashlib.sha256(
+        f"{intake.model_dump_json()}:{int(time.time() // 3600)}".encode()
+    ).hexdigest()[:16]
+
+    civic, vet, credit, home = await asyncio.gather(
+        evaluate_civic_aid(intake),
+        evaluate_veterans_affairs(intake),
+        evaluate_credit_repair(intake),
+        evaluate_home_loan(intake),
+    )
+
+    all_recs = civic + vet + credit + home
+    total_monthly = round(sum(r.estimated_monthly_value for r in all_recs), 2)
+    total_onetime = round(sum(r.estimated_one_time_value for r in all_recs), 2)
+
+    return UnifiedRoadmapResponse(
+        intake_hash=intake_hash,
+        total_estimated_monthly_value=total_monthly,
+        total_estimated_one_time_value=total_onetime,
+        recommendations=all_recs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. Resident Front-Door Web UI (Tier 1 Triage -> Roadmap -> Passkey Save)
+# ---------------------------------------------------------------------------
+HTML_PORTAL = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BEAST 3.0 | Indiana Resident Portal</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
+  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
+    <div class="max-w-3xl mx-auto px-4 py-4 flex justify-between items-center">
+      <div>
+        <span class="text-xs uppercase tracking-widest text-emerald-400 font-semibold">BEAST System 3.0</span>
+        <h1 class="text-lg font-bold">Indiana Resident Navigator</h1>
+      </div>
+      <button id="passkeyBtn" onclick="activatePasskey()"
+        class="text-xs bg-slate-800 hover:bg-slate-700 border border-slate-700 px-3 py-2 rounded-lg transition">
+        Tier 1: Guest Session (Enable Passkey)
+      </button>
+    </div>
+  </header>
+
+  <main class="max-w-3xl mx-auto px-4 py-8 space-y-8">
+    <!-- Screen 1: Ask Once Triage -->
+    <section id="triageCard" class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+      <h2 class="text-xl font-semibold mb-1">Tell us your situation once</h2>
+      <p class="text-sm text-slate-400 mb-6">
+        No SSN or wallet required. Instantly check Indiana benefits, veteran aid, credit relief, and homebuyer grants.
+      </p>
+
+      <form id="intakeForm" class="space-y-4">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Indiana ZIP Code</label>
+            <input type="text" id="zip_code" value="47802" required
+              class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:border-emerald-400 outline-none" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Household Size</label>
+            <input type="number" id="household_size" value="3" min="1" max="15" required
+              class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:border-emerald-400 outline-none" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Gross Monthly Income ($)</label>
+            <input type="number" id="gross_monthly_income" value="2400" min="0" step="50" required
+              class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:border-emerald-400 outline-none" />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2">
+          <label class="flex items-center gap-2 bg-slate-950 border border-slate-800 p-3 rounded-lg cursor-pointer text-sm">
+            <input type="checkbox" id="is_veteran" class="accent-emerald-400" />
+            <span>U.S. Military Veteran</span>
+          </label>
+          <label class="flex items-center gap-2 bg-slate-950 border border-slate-800 p-3 rounded-lg cursor-pointer text-sm">
+            <input type="checkbox" id="has_credit_challenges" checked class="accent-emerald-400" />
+            <span>Fix Credit / Debt Relief</span>
+          </label>
+          <label class="flex items-center gap-2 bg-slate-950 border border-slate-800 p-3 rounded-lg cursor-pointer text-sm">
+            <input type="checkbox" id="goal_first_home" checked class="accent-emerald-400" />
+            <span>Buy First Home</span>
+          </label>
+        </div>
+
+        <button type="submit"
+          class="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold py-3 rounded-xl transition">
+          Evaluate All Programs &rarr;
+        </button>
+      </form>
+    </section>
+
+    <!-- Screen 2: Unified Action Roadmap -->
+    <section id="roadmapSection" class="hidden space-y-6">
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div class="bg-emerald-950/40 border border-emerald-700/50 rounded-2xl p-5">
+          <div class="text-xs uppercase text-emerald-400 font-semibold">Estimated Monthly Relief</div>
+          <div id="monthlyTotal" class="text-3xl font-bold mt-1">$0/mo</div>
+        </div>
+        <div class="bg-sky-950/40 border border-sky-700/50 rounded-2xl p-5">
+          <div class="text-xs uppercase text-sky-400 font-semibold">One-Time Grants & Assistance</div>
+          <div id="onetimeTotal" class="text-3xl font-bold mt-1">$0</div>
+        </div>
+      </div>
+
+      <div id="programList" class="space-y-3"></div>
+    </section>
+  </main>
+
+  <script>
+    let currentTier = 1;
+
+    function activatePasskey() {
+      currentTier = 2;
+      const btn = document.getElementById("passkeyBtn");
+      btn.textContent = "Tier 2: Passkey Wallet Active (Gasless Ready)";
+      btn.classList.replace("border-slate-700", "border-emerald-500");
+      btn.classList.add("text-emerald-400");
+    }
+
+    document.getElementById("intakeForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const payload = {
+        zip_code: document.getElementById("zip_code").value,
+        household_size: parseInt(document.getElementById("household_size").value, 10),
+        gross_monthly_income: parseFloat(document.getElementById("gross_monthly_income").value),
+        is_veteran: document.getElementById("is_veteran").checked,
+        has_credit_challenges: document.getElementById("has_credit_challenges").checked,
+        goal_first_home: document.getElementById("goal_first_home").checked
+      };
+
+      const res = await fetch("/api/evaluate-household", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+
+      document.getElementById("monthlyTotal").textContent = `$${data.total_estimated_monthly_value.toLocaleString()}/mo`;
+      document.getElementById("onetimeTotal").textContent = `$${data.total_estimated_one_time_value.toLocaleString()}`;
+
+      const list = document.getElementById("programList");
+      list.innerHTML = data.recommendations.map(rec => `
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">${rec.division}</span>
+              <span class="text-xs text-emerald-400">Confidence: ${rec.confidence}</span>
+            </div>
+            <h3 class="font-semibold text-base mt-1">${rec.program_name}</h3>
+            <p class="text-sm text-slate-400 mt-1">Next: ${rec.next_action}</p>
+          </div>
+          <div class="text-right shrink-0">
+            <div class="font-bold text-emerald-400">
+              ${rec.estimated_monthly_value > 0 ? `$${rec.estimated_monthly_value}/mo` : `$${rec.estimated_one_time_value.toLocaleString()}`}
+            </div>
+            <button onclick="activatePasskey()"
+              class="mt-2 text-xs bg-slate-800 hover:bg-emerald-500 hover:text-slate-950 px-3 py-1.5 rounded-lg transition">
+              Unlock Tier ${rec.tier_required} Action
+            </button>
+          </div>
+        </div>
+      `).join("");
+
+      document.getElementById("roadmapSection").classList.remove("hidden");
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_portal():
+    return HTML_PORTAL
