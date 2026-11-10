@@ -1,0 +1,2 @@
+from readiness_simulator import router as simulator_router
+app.include_router(simulator_router)
