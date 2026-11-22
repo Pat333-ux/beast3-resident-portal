@@ -1,23 +1,18 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import type { Address, Hex } from "viem";
 import { verifyIntakeConsent, type ConsentDomain } from "../../../../auth/eip712Signer";
-import type { IntakeEnvelope, SignedConsentPayload } from "../../../../types/portal";
+import type { SignedConsentPayload } from "../../../../types/portal";
 
 export const runtime = "nodejs";
 
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_REPLAY_WINDOW_SECONDS = 300;
 const SAFE_ID = /^[A-Za-z0-9._:-]{8,128}$/;
 const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
-const KNOWN_FOCUS_AREAS = new Set([
-  "housing", "food", "utilities", "healthcare", "veteran_support",
-]);
+const KNOWN_FOCUS_AREAS = new Set(["housing", "food", "utilities", "healthcare", "veteran_support"]);
 
-type ErrorCode =
-  | "INVALID_REQUEST"
-  | "CONSENT_INVALID"
-  | "SERVICE_UNAVAILABLE"
-  | "WORKER_DISPATCH_FAILED";
+type ErrorCode = "INVALID_REQUEST" | "CONSENT_INVALID" | "REPLAY_REJECTED" | "SERVICE_UNAVAILABLE" | "WORKER_DISPATCH_FAILED";
 
 function jsonError(status: number, reasonCode: ErrorCode, correlationId: string) {
   return NextResponse.json(
@@ -44,13 +39,10 @@ function isProfile(value: unknown): boolean {
 }
 
 function parseConsent(value: unknown): SignedConsentPayload | null {
-  if (!isRecord(value)
-    || typeof value.intakeId !== "string"
-    || typeof value.consentVersion !== "string"
-    || typeof value.purpose !== "string"
-    || typeof value.issuedAt !== "string"
-    || typeof value.expiresAt !== "string") return null;
-  if (!/^\d{1,20}$/.test(value.issuedAt) || !/^\d{1,20}$/.test(value.expiresAt)) return null;
+  if (!isRecord(value) || typeof value.intakeId !== "string"
+    || typeof value.consentVersion !== "string" || typeof value.purpose !== "string"
+    || typeof value.issuedAt !== "string" || typeof value.expiresAt !== "string"
+    || !/^\d{1,20}$/.test(value.issuedAt) || !/^\d{1,20}$/.test(value.expiresAt)) return null;
   try {
     return {
       intakeId: value.intakeId,
@@ -66,7 +58,7 @@ function parseConsent(value: unknown): SignedConsentPayload | null {
 
 function requiredEnv(name: string): string {
   const value = process.env[name];
-  if (!value || !value.trim()) throw new Error("CONFIGURATION_MISSING");
+  if (!value?.trim()) throw new Error("CONFIGURATION_MISSING");
   return value;
 }
 
@@ -80,37 +72,32 @@ function makeDomain(): ConsentDomain {
   };
 }
 
-function computeHmac(secret: string, timestamp: string, body: string): string {
-  return createHmac("sha256", secret).update(`${timestamp}.${body}`, "utf8").digest("hex");
+function deriveEventId(intakeId: string, issuedAt: string, signature: string): string {
+  const digest = createHash("sha256").update(`${intakeId}:${issuedAt}:${signature}`, "utf8").digest("hex").slice(0, 32);
+  return `evt_${digest}`;
 }
 
-function secureEqualHex(expected: string, received: string): boolean {
-  if (!/^[0-9a-f]{64}$/.test(received) || !/^[0-9a-f]{64}$/.test(expected)) return false;
-  return timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(received, "hex"));
+function computeHmac(secret: string, timestamp: string, body: string): string {
+  return createHmac("sha256", secret).update(`${timestamp}.${body}`, "utf8").digest("hex");
 }
 
 export async function POST(request: NextRequest) {
   const suppliedCorrelationId = request.headers.get("x-correlation-id");
   if (suppliedCorrelationId && !SAFE_ID.test(suppliedCorrelationId)) {
-    return jsonError(400, "INVALID_REQUEST", randomUUID());
+    return jsonError(400, "INVALID_REQUEST", `corr_${randomUUID()}`);
   }
   const correlationId = suppliedCorrelationId ?? `corr_${randomUUID()}`;
-  const eventId = `evt_${randomUUID()}`;
   const contentLength = Number(request.headers.get("content-length") ?? 0);
   if (contentLength > MAX_BODY_BYTES) return jsonError(413, "INVALID_REQUEST", correlationId);
 
-  let rawBody: string;
   let body: unknown;
   try {
-    rawBody = await request.text();
-    if (Buffer.byteLength(rawBody, "utf8") > MAX_BODY_BYTES) {
-      return jsonError(413, "INVALID_REQUEST", correlationId);
-    }
-    body = JSON.parse(rawBody);
+    const raw = await request.text();
+    if (Buffer.byteLength(raw, "utf8") > MAX_BODY_BYTES) return jsonError(413, "INVALID_REQUEST", correlationId);
+    body = JSON.parse(raw);
   } catch {
     return jsonError(400, "INVALID_REQUEST", correlationId);
   }
-
   if (!isRecord(body) || !isRecord(body.intake) || !isRecord(body.consent)
     || typeof body.signature !== "string" || !SIGNATURE.test(body.signature)
     || typeof body.signerAddress !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(body.signerAddress)) {
@@ -119,14 +106,21 @@ export async function POST(request: NextRequest) {
 
   const intake = body.intake;
   const consent = parseConsent(body.consent);
-  if (intake.schemaVersion !== "1.0.0"
-    || typeof intake.intakeId !== "string" || !SAFE_ID.test(intake.intakeId)
-    || typeof intake.submittedAt !== "string"
-    || Number.isNaN(Date.parse(intake.submittedAt))
-    || !isProfile(intake.profile)
-    || !consent || consent.intakeId !== intake.intakeId
+  if (intake.schemaVersion !== "1.0.0" || typeof intake.intakeId !== "string" || !SAFE_ID.test(intake.intakeId)
+    || typeof intake.submittedAt !== "string" || Number.isNaN(Date.parse(intake.submittedAt))
+    || !isProfile(intake.profile) || !consent || consent.intakeId !== intake.intakeId
     || consent.purpose !== "resident_intake_submission") {
     return jsonError(400, "INVALID_REQUEST", correlationId);
+  }
+
+  const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
+  const replayWindow = BigInt(MAX_REPLAY_WINDOW_SECONDS);
+  if (consent.issuedAt > nowSeconds + replayWindow
+    || nowSeconds - consent.issuedAt > replayWindow
+    || consent.expiresAt <= nowSeconds
+    || consent.expiresAt <= consent.issuedAt
+    || consent.expiresAt - consent.issuedAt > 86_400n) {
+    return jsonError(403, "REPLAY_REJECTED", correlationId);
   }
 
   let secret: string;
@@ -144,24 +138,15 @@ export async function POST(request: NextRequest) {
     return jsonError(503, "SERVICE_UNAVAILABLE", correlationId);
   }
 
-  const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
-  if (consent.issuedAt > nowSeconds + 300n || consent.expiresAt <= nowSeconds
-    || consent.expiresAt - consent.issuedAt > 86_400n) {
-    return jsonError(401, "CONSENT_INVALID", correlationId);
-  }
   let consentValid = false;
   try {
-    consentValid = await verifyIntakeConsent(
-      domain,
-      consent,
-      body.signature as Hex,
-      body.signerAddress as Address,
-    );
+    consentValid = await verifyIntakeConsent(domain, consent, body.signature as Hex, body.signerAddress as Address);
   } catch {
     consentValid = false;
   }
   if (!consentValid) return jsonError(401, "CONSENT_INVALID", correlationId);
 
+  const eventId = deriveEventId(intake.intakeId, body.consent.issuedAt as string, body.signature);
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const envelope = {
     event_id: eventId,
@@ -171,7 +156,6 @@ export async function POST(request: NextRequest) {
     attempt: 0,
   };
   const serializedEnvelope = JSON.stringify(envelope);
-  const signature = computeHmac(secret, timestamp, serializedEnvelope);
 
   let response: Response;
   try {
@@ -182,7 +166,7 @@ export async function POST(request: NextRequest) {
         "x-correlation-id": correlationId,
         "x-event-id": eventId,
         "x-request-timestamp": timestamp,
-        "x-signature-256": `sha256=${signature}`,
+        "x-signature-256": `sha256=${computeHmac(secret, timestamp, serializedEnvelope)}`,
       },
       body: serializedEnvelope,
       cache: "no-store",
@@ -190,6 +174,12 @@ export async function POST(request: NextRequest) {
     });
   } catch {
     return jsonError(502, "WORKER_DISPATCH_FAILED", correlationId);
+  }
+  if (response.status === 409) {
+    return NextResponse.json(
+      { status: "IN_PROGRESS", eventId, correlationId },
+      { status: 409, headers: { "x-correlation-id": correlationId, "cache-control": "no-store" } },
+    );
   }
   if (!response.ok) return jsonError(502, "WORKER_DISPATCH_FAILED", correlationId);
 
@@ -200,13 +190,8 @@ export async function POST(request: NextRequest) {
     return jsonError(502, "WORKER_DISPATCH_FAILED", correlationId);
   }
   const resultStatus = isRecord(workerResult) ? workerResult.status : undefined;
-  const status = resultStatus === "success" || resultStatus === "COMPLETED"
-    ? "COMPLETED"
-    : resultStatus === "escalated_to_manual_review" || resultStatus === "ESCALATED"
-      ? "ESCALATED"
-      : "QUEUED";
-
-  // Log only fixed status and opaque trace identifiers, never request/response data.
+  const status = resultStatus === "success" || resultStatus === "COMPLETED" ? "COMPLETED"
+    : resultStatus === "escalated_to_manual_review" || resultStatus === "ESCALATED" ? "ESCALATED" : "QUEUED";
   console.info(JSON.stringify({ level: "INFO", code: "INTAKE_DISPATCHED", correlation_id: correlationId, event_id: eventId, status }));
   return NextResponse.json(
     { status, eventId, correlationId },
